@@ -21,21 +21,26 @@ The core algorithm(s) for processing a one or more reference and hypothesis sent
 so that measures can be computed and an alignment can be visualized.
 """
 
-from collections import defaultdict
 from dataclasses import dataclass
+
 from typing import Any, List, Union
+from itertools import chain
 
 import rapidfuzz
 
+from rapidfuzz.distance import Opcodes
+
 from jiwer import transforms as tr
-from jiwer.transformations import cer_default, wer_default
+from jiwer.transformations import wer_default, cer_default
+
 
 __all__ = [
     "AlignmentChunk",
-    "CharacterOutput",
     "WordOutput",
-    "process_characters",
+    "CharacterOutput",
     "process_words",
+    "process_words_embdiff",
+    "process_characters",
 ]
 
 
@@ -145,16 +150,14 @@ def process_words(
 
     Returns:
         (WordOutput): The processed reference and hypothesis sentences
-
-    Raises:
-        ValueError: If one or more references are empty strings
-        ValueError: If after applying transforms, reference and hypothesis lengths don't match
     """
     # validate input type
     if isinstance(reference, str):
         reference = [reference]
     if isinstance(hypothesis, str):
         hypothesis = [hypothesis]
+    if any(len(t) == 0 for t in reference):
+        raise ValueError("one or more references are empty strings")
 
     # pre-process reference and hypothesis by applying transforms
     ref_transformed = _apply_transform(
@@ -172,9 +175,9 @@ def process_words(
             f"{len(hyp_transformed)} hypothesis sentences."
         )
 
-    # Map each word into a unique integer in order to compute
+    # Change each word into a unique character in order to compute
     # word-level levenshtein distance
-    ref_as_ints, hyp_as_ints = _word2int(ref_transformed, hyp_transformed)
+    ref_as_chars, hyp_as_chars = _word2char(ref_transformed, hyp_transformed)
 
     # keep track of total hits, substitutions, deletions and insertions
     # across all input sentences
@@ -186,72 +189,48 @@ def process_words(
     # anf finally, keep track of the alignment between each reference and hypothesis
     alignments = []
 
-    for reference_sentence, hypothesis_sentence in zip(ref_as_ints, hyp_as_ints):
-        # Get the opcodes directly
-        opcodes = rapidfuzz.distance.Levenshtein.opcodes(
+    for reference_sentence, hypothesis_sentence in zip(ref_as_chars, hyp_as_chars):
+        # Get the required edit operations to transform reference into hypothesis
+        edit_ops = rapidfuzz.distance.Levenshtein.editops(
             reference_sentence, hypothesis_sentence
         )
 
-        subs = dels = ins = hits = 0
-        sentence_op_chunks = []
+        # count the number of edits of each type
+        substitutions = sum(1 if op.tag == "replace" else 0 for op in edit_ops)
+        deletions = sum(1 if op.tag == "delete" else 0 for op in edit_ops)
+        insertions = sum(1 if op.tag == "insert" else 0 for op in edit_ops)
+        hits = len(reference_sentence) - (substitutions + deletions)
 
-        for tag, i1, i2, j1, j2 in opcodes:
-            # Create alignment chunk
-            sentence_op_chunks.append(
-                AlignmentChunk(
-                    type=tag,
-                    ref_start_idx=i1,
-                    ref_end_idx=i2,
-                    hyp_start_idx=j1,
-                    hyp_end_idx=j2,
-                )
-            )
-
-            # Update counts
-            if tag == "equal":
-                hits += i2 - i1
-            elif tag == "replace":
-                subs += i2 - i1
-            elif tag == "delete":
-                dels += i2 - i1
-            elif tag == "insert":
-                ins += j2 - j1
-
-        # Update global counts
+        # update state
         num_hits += hits
-        num_substitutions += subs
-        num_deletions += dels
-        num_insertions += ins
+        num_substitutions += substitutions
+        num_deletions += deletions
+        num_insertions += insertions
         num_rf_words += len(reference_sentence)
         num_hp_words += len(hypothesis_sentence)
-        alignments.append(sentence_op_chunks)
+        alignments.append(
+            [
+                AlignmentChunk(
+                    type=op.tag,
+                    ref_start_idx=op.src_start,
+                    ref_end_idx=op.src_end,
+                    hyp_start_idx=op.dest_start,
+                    hyp_end_idx=op.dest_end,
+                )
+                for op in Opcodes.from_editops(edit_ops)
+            ]
+        )
 
     # Compute all measures
-    subs, dels, ins, hits = num_substitutions, num_deletions, num_insertions, num_hits
+    S, D, I, H = num_substitutions, num_deletions, num_insertions, num_hits
 
-    # special edge-case for empty references
-    if num_rf_words == 0:
-        wer = num_insertions
-
-        # if the reference was silence and this is correctly predicted,
-        # there is no error and all information is preserved
-        if num_hp_words == 0:
-            mer = 0
-            wip = 1
-        else:
-            mer = 1
-            wip = 0
-
-    else:
-        wer = float(subs + dels + ins) / float(hits + subs + dels)
-        mer = float(subs + dels + ins) / float(hits + subs + dels + ins)
-
-        # there is an edge-case when hypothesis is empty
-        if num_hp_words >= 1:
-            wip = (float(hits) / num_rf_words) * (float(hits) / num_hp_words)
-        else:
-            wip = 0
-
+    wer = float(S + D + I) / float(H + S + D)
+    mer = float(S + D + I) / float(H + S + D + I)
+    wip = (
+        (float(H) / num_rf_words) * (float(H) / num_hp_words)
+        if num_hp_words >= 1
+        else 0
+    )
     wil = 1 - wip
 
     # return all output
@@ -268,6 +247,123 @@ def process_words(
         insertions=num_insertions,
         deletions=num_deletions,
     )
+
+def process_words_embdiff(
+    reference: Union[str, List[str]],
+    hypothesis: Union[str, List[str]],
+    reference_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
+    hypothesis_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
+) -> WordOutput:
+    """
+    Compute the word-level levenshtein distance and alignment between one or more
+    reference and hypothesis sentences. Based on the result, multiple measures
+    can be computed, such as the word error rate.
+
+    Args:
+        reference: The reference sentence(s)
+        hypothesis: The hypothesis sentence(s)
+        reference_transform: The transformation(s) to apply to the reference string(s)
+        hypothesis_transform: The transformation(s) to apply to the hypothesis string(s)
+
+    Returns:
+        (WordOutput): The processed reference and hypothesis sentences
+    """
+    # validate input type
+    if isinstance(reference, str):
+        reference = [reference]
+    if isinstance(hypothesis, str):
+        hypothesis = [hypothesis]
+    if any(len(t) == 0 for t in reference):
+        raise ValueError("one or more references are empty strings")
+
+    # pre-process reference and hypothesis by applying transforms
+    ref_transformed = _apply_transform(
+        reference, reference_transform, is_reference=True
+    )
+    hyp_transformed = _apply_transform(
+        hypothesis, hypothesis_transform, is_reference=False
+    )
+
+    if len(ref_transformed) != len(hyp_transformed):
+        raise ValueError(
+            "After applying the transforms on the reference and hypothesis sentences, "
+            f"their lengths must match. "
+            f"Instead got {len(ref_transformed)} reference and "
+            f"{len(hyp_transformed)} hypothesis sentences."
+        )
+
+    # Change each word into a unique character in order to compute
+    # word-level levenshtein distance
+    ref_as_chars, hyp_as_chars = _word2char(ref_transformed, hyp_transformed)
+
+    # keep track of total hits, substitutions, deletions and insertions
+    # across all input sentences
+    num_hits, num_substitutions, num_deletions, num_insertions = 0, 0, 0, 0
+
+    # also keep track of the total number of words in the reference and hypothesis
+    num_rf_words, num_hp_words = 0, 0
+
+    # anf finally, keep track of the alignment between each reference and hypothesis
+    alignments = []
+
+    for reference_sentence, hypothesis_sentence in zip(ref_as_chars, hyp_as_chars):
+        # Get the required edit operations to transform reference into hypothesis
+        edit_ops = rapidfuzz.distance.Levenshtein.editops(
+            reference_sentence, hypothesis_sentence
+        )
+
+        # count the number of edits of each type
+        substitutions = sum(1 if op.tag == "replace" else 0 for op in edit_ops)
+        deletions = sum(1 if op.tag == "delete" else 0 for op in edit_ops)
+        insertions = sum(1 if op.tag == "insert" else 0 for op in edit_ops)
+        hits = len(reference_sentence) - (substitutions + deletions)
+
+        # update state
+        num_hits += hits
+        num_substitutions += substitutions
+        num_deletions += deletions
+        num_insertions += insertions
+        num_rf_words += len(reference_sentence)
+        num_hp_words += len(hypothesis_sentence)
+        alignments.append(
+            [
+                AlignmentChunk(
+                    type=op.tag,
+                    ref_start_idx=op.src_start,
+                    ref_end_idx=op.src_end,
+                    hyp_start_idx=op.dest_start,
+                    hyp_end_idx=op.dest_end,
+                )
+                for op in Opcodes.from_editops(edit_ops)
+            ]
+        )
+
+    # Compute all measures
+    S, D, I, H = num_substitutions, num_deletions, num_insertions, num_hits
+
+    wer = float(S + D + I) / float(H + S + D)
+    mer = float(S + D + I) / float(H + S + D + I)
+    wip = (
+        (float(H) / num_rf_words) * (float(H) / num_hp_words)
+        if num_hp_words >= 1
+        else 0
+    )
+    wil = 1 - wip
+
+    # return all output
+    return WordOutput(
+        references=ref_transformed,
+        hypotheses=hyp_transformed,
+        alignments=alignments,
+        wer=wer,
+        mer=mer,
+        wil=wil,
+        wip=wip,
+        hits=num_hits,
+        substitutions=num_substitutions,
+        insertions=num_insertions,
+        deletions=num_deletions,
+    ), edit_ops
 
 
 ########################################################################################
@@ -337,6 +433,8 @@ def process_characters(
         (CharacterOutput): The processed reference and hypothesis sentences.
 
     """
+    # make sure the transforms end with tr.ReduceToListOfListOfChars(),
+
     # it's the same as word processing, just every word is of length 1
     result = process_words(
         reference, hypothesis, reference_transform, hypothesis_transform
@@ -368,24 +466,35 @@ def _apply_transform(
     transformed_sentence = transform(sentence)
 
     # Validate the output is a list containing lists of strings
-    if not _is_list_of_list_of_strings(transformed_sentence):
-        raise ValueError(
-            "After applying the transformation, each "
-            f"{'reference' if is_reference else 'hypothesis'} should be a "
-            "list of strings, with each string being a single word or character."
-            "Please ensure the given transformation reduces the input "
-            "to a list of list strings."
-        )
+    if is_reference:
+        if not _is_list_of_list_of_strings(
+            transformed_sentence, require_non_empty_lists=True
+        ):
+            raise ValueError(
+                "After applying the transformation, each reference should be a "
+                "non-empty list of strings, with each string being a single word."
+            )
+    else:
+        if not _is_list_of_list_of_strings(
+            transformed_sentence, require_non_empty_lists=False
+        ):
+            raise ValueError(
+                "After applying the transformation, each hypothesis should be a "
+                "list of strings, with each string being a single word."
+            )
 
     return transformed_sentence
 
 
-def _is_list_of_list_of_strings(x: Any):
+def _is_list_of_list_of_strings(x: Any, require_non_empty_lists: bool):
     if not isinstance(x, list):
         return False
 
     for e in x:
         if not isinstance(e, list):
+            return False
+
+        if require_non_empty_lists and len(e) == 0:
             return False
 
         if not all([isinstance(s, str) for s in e]):
@@ -394,24 +503,23 @@ def _is_list_of_list_of_strings(x: Any):
     return True
 
 
-def _word2int(reference: List[List[str]], hypothesis: List[List[str]]):
-    """
-    Maps each unique word in the reference and hypothesis sentences to a unique integer
-    for Levenshtein distance calculation.
+def _word2char(reference: List[List[str]], hypothesis: List[List[str]]):
+    # tokenize each word into an integer
+    vocabulary = set(chain(*reference, *hypothesis))
 
-    Args:
-        reference: List of reference sentences, where each sentence is a list of words
-        hypothesis: List of hypothesis sentences, where each sentence is a list of words
+    if "" in vocabulary:
+        raise ValueError(
+            "Empty strings cannot be a word. "
+            "Please ensure that the given transform removes empty strings."
+        )
 
-    Returns:
-        Tuple[List[List[int]], List[List[int]]]: The reference and hypothesis sentences
-        with words mapped to unique integers
-    """
-    word2int = defaultdict()
-    word2int.default_factory = word2int.__len__  # Auto-incrementing IDs
+    word2char = dict(zip(vocabulary, range(len(vocabulary))))
 
-    # Single pass through all words using generator expressions
-    ref_ints = [[word2int[word] for word in sentence] for sentence in reference]
-    hyp_ints = [[word2int[word] for word in sentence] for sentence in hypothesis]
+    reference_chars = [
+        "".join([chr(word2char[w]) for w in sentence]) for sentence in reference
+    ]
+    hypothesis_chars = [
+        "".join([chr(word2char[w]) for w in sentence]) for sentence in hypothesis
+    ]
 
-    return ref_ints, hyp_ints
+    return reference_chars, hypothesis_chars

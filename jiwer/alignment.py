@@ -33,7 +33,6 @@ def visualize_alignment(
     output: Union[WordOutput, CharacterOutput],
     show_measures: bool = True,
     skip_correct: bool = True,
-    line_width: Optional[int] = None,
 ) -> str:
     """
     Visualize the output of [jiwer.process_words][process.process_words] and
@@ -47,14 +46,12 @@ def visualize_alignment(
         show_measures: If enabled, the visualization will include measures like the WER
                        or CER
         skip_correct: If enabled, the visualization will exclude correct reference and hypothesis pairs
-        line_width: If set, try, at best effort, to spit sentences into multiple lines if they exceed the width.
 
     Returns:
         (str): The visualization as a string
 
     Example:
         This code snippet
-
         ```python
         import jiwer
 
@@ -65,23 +62,18 @@ def visualize_alignment(
 
         print(jiwer.visualize_alignment(out))
         ```
-
         will produce this visualization:
-
         ```txt
-        === SENTENCE 1 ===
-
+        sentence 1
         REF:    # short one here
         HYP: shoe order one    *
                 I     S        D
 
-        === SENTENCE 2 ===
-
+        sentence 2
         REF: quite a bit of  #    #  longer sentence    #
         HYP: quite * bit of an even longest sentence here
                    D         I    I       S             I
 
-        === SUMMARY ===
         number of sentences: 2
         substitutions=2 deletions=2 insertions=4 hits=5
 
@@ -94,30 +86,15 @@ def visualize_alignment(
         When `show_measures=False`, only the alignment will be printed:
 
         ```txt
-        === SENTENCE 1 ===
-
+        sentence 1
         REF:    # short one here
         HYP: shoe order one    *
                 I     S        D
 
-        === SENTENCE 2 ===
-
+        sentence 2
         REF: quite a bit of  #    #  longer sentence    #
         HYP: quite * bit of an even longest sentence here
                    D         I    I       S             I
-        ```
-
-        When setting `line_width=80`, the following output will be split into multiple lines:
-
-        ```txt
-        === SENTENCE 1 ===
-
-        REF: This is a very  long sentence that is *** much longer than the previous one
-        HYP: This is a very loong sentence that is not much longer than the previous one
-                                S                    I
-        REF: or the one before that
-        HYP: or *** one before that
-                  D
         ```
     """
     references = output.references
@@ -127,19 +104,16 @@ def visualize_alignment(
 
     final_str = ""
     for idx, (gt, hp, chunks) in enumerate(zip(references, hypothesis, alignment)):
-        if skip_correct and (
-            len(chunks) == 0 or (len(chunks) == 1 and chunks[0].type == "equal")
-        ):
+        if skip_correct and len(chunks) == 1 and chunks[0].type == "equal":
             continue
 
-        final_str += f"=== SENTENCE {idx + 1} ===\n\n"
+        final_str += f"sentence {idx+1}\n"
         final_str += _construct_comparison_string(
-            gt, hp, chunks, include_space_seperator=not is_cer, line_width=line_width
+            gt, hp, chunks, include_space_seperator=not is_cer
         )
         final_str += "\n"
 
     if show_measures:
-        final_str += "=== SUMMARY ===\n"
         final_str += f"number of sentences: {len(alignment)}\n"
         final_str += f"substitutions={output.substitutions} "
         final_str += f"deletions={output.deletions} "
@@ -147,12 +121,12 @@ def visualize_alignment(
         final_str += f"hits={output.hits}\n"
 
         if is_cer:
-            final_str += f"\ncer={output.cer * 100:.2f}%\n"
+            final_str += f"\ncer={output.cer*100:.2f}%\n"
         else:
-            final_str += f"\nmer={output.mer * 100:.2f}%"
-            final_str += f"\nwil={output.wil * 100:.2f}%"
-            final_str += f"\nwip={output.wip * 100:.2f}%"
-            final_str += f"\nwer={output.wer * 100:.2f}%\n"
+            final_str += f"\nmer={output.mer*100:.2f}%"
+            final_str += f"\nwil={output.wil*100:.2f}%"
+            final_str += f"\nwip={output.wip*100:.2f}%"
+            final_str += f"\nwer={output.wer*100:.2f}%\n"
     else:
         # remove last newline
         final_str = final_str[:-1]
@@ -165,12 +139,10 @@ def _construct_comparison_string(
     hypothesis: List[str],
     ops: List[AlignmentChunk],
     include_space_seperator: bool = False,
-    line_width: Optional[int] = None,
 ) -> str:
     ref_str = "REF: "
     hyp_str = "HYP: "
     op_str = "     "
-    agg_str = ""  # aggregate string for max_chars split
 
     for op in ops:
         if op.type == "equal" or op.type == "substitute":
@@ -192,19 +164,6 @@ def _construct_comparison_string(
         for rf, hp, c in zip(ref, hyp, op_chars):
             str_len = max(len(rf), len(hp), len(c))
 
-            if line_width is not None:
-                if len(ref_str) + str_len > line_width:
-                    # aggregate the strings
-                    if include_space_seperator:
-                        agg_str += f"{ref_str[:-1]}\n{hyp_str[:-1]}\n{op_str[:-1]}\n\n"
-                    else:
-                        agg_str += f"{ref_str}\n{hyp_str}\n{op_str}\n\n"
-
-                    # reset the strings
-                    ref_str = "REF: "
-                    hyp_str = "HYP: "
-                    op_str = "     "
-
             if rf == "*":
                 rf = "".join(["*"] * str_len)
             elif hp == "*":
@@ -221,9 +180,9 @@ def _construct_comparison_string(
 
     if include_space_seperator:
         # remove last space
-        return agg_str + f"{ref_str[:-1]}\n{hyp_str[:-1]}\n{op_str[:-1]}\n"
+        return f"{ref_str[:-1]}\n{hyp_str[:-1]}\n{op_str[:-1]}\n"
     else:
-        return agg_str + f"{ref_str}\n{hyp_str}\n{op_str}\n"
+        return f"{ref_str}\n{hyp_str}\n{op_str}\n"
 
 
 def collect_error_counts(output: Union[WordOutput, CharacterOutput]):
